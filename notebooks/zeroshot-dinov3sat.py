@@ -283,12 +283,21 @@ def _(
 
 @app.cell
 def _(entry, pd, project_root):
-    results_path = project_root / "out/zeroshot-comparison.csv"
-    results = pd.read_csv(results_path).to_dict(orient="records") if results_path.exists() else []
+    results_path = project_root / "out/zeroshot-comparison.tsv"
+    results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
 
     results.append(entry)
 
-    pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, index=False)
+    pd.DataFrame(results).drop_duplicates(
+        subset=["model", "model_extra", "dataset", "dataset_extra", "retriever_type"],
+    ).sort_values(
+        "Recall@1",
+        ascending=False,
+    ).to_csv(
+        results_path,
+        sep="\t",
+        index=False,
+    )
     return
 
 
