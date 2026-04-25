@@ -1,0 +1,16 @@
+# Misc
+__pycache__/
+*.py[oc]
+wheels/
+*.egg-info
+.DS_Store
+.ruff_cache
+.venv
+
+
+# Stuff
+.env
+data/
+checkpoints/
+
+__marimo__/

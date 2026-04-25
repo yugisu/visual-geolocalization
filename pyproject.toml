@@ -1,0 +1,27 @@
+[project]
+name = "visual-geolocalization"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "~=3.10"
+dependencies = ["marimo>=0.23.3", "python-dotenv>=1.2.2"]
+
+
+[tool.marimo.runtime]
+output_max_bytes = 10_000_000
+
+[tool.ruff]
+extend-include = ["*.ipynb"]
+indent-width = 4
+line-length = 140
+
+[tool.ruff.lint]
+extend-ignore = ["E402"]
+unfixable = ["F401"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
