@@ -290,6 +290,8 @@ def _(entry, pd, project_root):
     results_path = project_root / "out/zeroshot-comparison.tsv"
     results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
 
+    key_cols = ["model", "model_extra", "dataset", "dataset_extra"]
+    results = [r for r in results if not all(str(r.get(k)) == str(entry.get(k)) for k in key_cols)]
     results.append(entry)
 
     pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)

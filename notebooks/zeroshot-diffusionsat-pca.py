@@ -3,28 +3,23 @@
 # dependencies = [
 #     "marimo",
 #     "python-dotenv==1.2.2",
-#     "setuptools<81",
-#     "numpy==1.26.3",
+#     "torch>=2.2.0",
+#     "torchvision",
+#     "numpy>=1.26.3,<2",
+#     "pillow>=12.1.1",
+#     "rasterio>=1.4.4",
+#     "pandas>=2.3.3",
+#     "tqdm>=4.67.3",
+#     "matplotlib>=3.10.0",
+#     "scikit-learn>=1.5.0",
 #     "diffusers==0.17.0",
-#     "torch==2.2.2",
-#     "torchvision==0.17.2",
-#     "accelerate==0.18.0",
 #     "transformers==4.40.0",
-#     "scikit-learn==1.5.2",
-#     "huggingface_hub==0.19.3",
-#     "h5py==3.11.0",
-#     "einops>=0.8.2",
-#     "pandas==2.3.3",
+#     "huggingface-hub==0.19.3",
+#     "accelerate==0.18.0",
+#     "xformers==0.0.25.post1",
+#     "setuptools<81",
 #     "faiss-cpu>=1.7.4",
-#     "tqdm==4.67.3",
-#     "rasterio==1.4.4",
-#     "satdifuser",
-#     "diffusion-vpr",
 # ]
-#
-# [tool.uv.sources]
-# satdifuser = { path = "../../SatDiFuser", editable = true }
-# diffusion-vpr = { path = "../../diffusion-vpr", editable = true }
 # ///
 
 import marimo
@@ -53,15 +48,13 @@ def _():
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
 
-    diffusion_vpr_root = project_root.parent / "diffusion-vpr"
-    sys.path.insert(0, str(diffusion_vpr_root))
-
     from lib.visloc import SatChunkDataset, UAVDataset
     from lib.evaluation import calculate_metrics
 
     load_dotenv(project_root / ".env")
     data_root = Path(os.environ["DATA_ROOT"])
     visloc_root = data_root / "visloc"
+    diffusionsat_ckpt = Path(os.environ["CHECKPOINTS_ROOT"]) / "finetune_sd21_256_sn-satlas-fmow_snr5_md7norm_bs64_trimmed"
 
     warnings.filterwarnings("ignore", message=".*invalid escape sequence.*")
 
@@ -77,74 +70,109 @@ def _():
         SatChunkDataset,
         UAVDataset,
         calculate_metrics,
+        diffusionsat_ckpt,
         np,
         pd,
         project_root,
         time,
         torch,
-        transforms,
         tqdm,
+        transforms,
         visloc_root,
     )
 
 
 @app.cell
-def _(DEVICE, DTYPE):
-    import torch as _torch
-    from diffusers import StableDiffusionPipeline
+def _(DEVICE, DTYPE, diffusionsat_ckpt, torch):
+    from diffusers import AutoencoderKL, DDIMScheduler
+    from transformers import CLIPTextModel, CLIPTokenizer
+    from lib.diffusionsat import SatUNet
 
-    from src.embedders import PoolConcatEmbedder
-    from src.ldm_extractor import LDMExtractor, LDMExtractorCfg
+    BATCH_SIZE = 32
+    IMG_SIZE = 256
+    DDIM_STEPS = 10
+    COLLECT = {0, 1, 2}  # low-noise inversion steps: t≈1, 101, 201
+    PROMPT = "A satellite image"
 
-    class StableDiffusion21Backbone(_torch.nn.Module):
-        def __init__(self, device: _torch.device, dtype: _torch.dtype):
-            super().__init__()
-            self.device = device
-            self.dtype = dtype
+    print("Loading DiffusionSat SatUNet, VAE, CLIP text encoder...")
+    unet = SatUNet.from_pretrained(
+        str(diffusionsat_ckpt),
+        subfolder="checkpoint-150000/unet",
+        num_metadata=0,
+        use_metadata=False,
+        low_cpu_mem_usage=False,
+        torch_dtype=DTYPE,
+    ).to(DEVICE)
 
-            self.pipe = StableDiffusionPipeline.from_pretrained(
-                "sd2-community/stable-diffusion-2-1",
-                torch_dtype=self.dtype,
-                low_cpu_mem_usage=False,
-            )
-            self.pipe = self.pipe.to(device)
-            self.vae = self.pipe.vae
-            self.ldm_extractor: LDMExtractor | None = None
+    vae = AutoencoderKL.from_pretrained(str(diffusionsat_ckpt), subfolder="vae", torch_dtype=DTYPE).to(DEVICE)
 
-        def set_ldm_extractor_cfg(self, cfg: LDMExtractorCfg):
-            self.ldm_extractor_cfg = cfg
-            with _torch.autocast(str(self.device), dtype=self.dtype):
-                self.ldm_extractor = LDMExtractor(cfg, self.pipe)
+    tokenizer = CLIPTokenizer.from_pretrained(str(diffusionsat_ckpt), subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(str(diffusionsat_ckpt), subfolder="text_encoder", torch_dtype=DTYPE).to(DEVICE)
 
-        @_torch.inference_mode()
-        def forward(self, imgs: _torch.Tensor) -> dict:
-            if self.ldm_extractor is None:
-                raise ValueError("LDM extractor not configured. Please call set_ldm_extractor_cfg() first.")
-            latents = self.vae.encode(imgs.to(dtype=self.dtype)).latent_dist.sample() * 0.18215
-            feats, _ = self.ldm_extractor.forward(latents)
-            return feats
+    scheduler = DDIMScheduler.from_pretrained(str(diffusionsat_ckpt), subfolder="scheduler")
+    scheduler.set_timesteps(DDIM_STEPS)
+    inv_timesteps = list(reversed(scheduler.timesteps.tolist()))
+    alphas_cumprod = scheduler.alphas_cumprod
+    print(f"DDIM inversion timesteps (clean→noisy): {inv_timesteps}")
 
-    BATCH_SIZE = 256
+    unet.eval().requires_grad_(False)
+    vae.eval().requires_grad_(False)
+    text_encoder.eval().requires_grad_(False)
 
-    SAVE_TIMESTEPS = [8, 7]
-    NUM_TIMESTEPS = 10
-    LAYER_IDXS = {"down_blocks": {"attn1": "all"}}
+    try:
+        unet.enable_xformers_memory_efficient_attention()
+        print("xformers enabled.")
+    except Exception:
+        pass
 
-    backbone = StableDiffusion21Backbone(DEVICE, DTYPE)
-    cfg = LDMExtractorCfg(
-        prompt="",
-        save_timesteps=SAVE_TIMESTEPS,
-        num_timesteps=NUM_TIMESTEPS,
-        layer_idxs=LAYER_IDXS,
-        batch_size=BATCH_SIZE,
+    _text_inputs = tokenizer(
+        PROMPT,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=tokenizer.model_max_length,
+        truncation=True,
     )
-    backbone.set_ldm_extractor_cfg(cfg)
+    with torch.inference_mode():
+        prompt_embeds = text_encoder(_text_inputs.input_ids.to(DEVICE))[0]
 
-    embedder = PoolConcatEmbedder(
-        feature_dims=backbone.ldm_extractor.collected_dims,
-        save_timesteps=SAVE_TIMESTEPS,
+    # Hook attn1 (self-attention) inside each Transformer2DModel in down_blocks.
+    # Matches train.py: layer_idxs={'down_blocks': {'attn1': 'all'}}
+    features_dict = {}
+
+    def _make_hook(name):
+        def hook(_module, _input, output):
+            out = output[0] if isinstance(output, tuple) else output
+            if hasattr(out, "sample"):
+                out = out.sample
+            out = out.detach().float()
+            if out.dim() == 3:
+                B, L, C = out.shape
+                H = W = int(L**0.5)
+                out = out.reshape(B, H, W, C).permute(0, 3, 1, 2)
+            features_dict[name] = out
+
+        return hook
+
+    _hooks = []
+    for _i, _block in enumerate(unet.down_blocks):
+        if hasattr(_block, "attentions"):
+            for _j, _transformer in enumerate(_block.attentions):
+                for _k, _tblock in enumerate(_transformer.transformer_blocks):
+                    _hooks.append(_tblock.attn1.register_forward_hook(_make_hook(f"d{_i}_{_j}_{_k}")))
+    print(f"Registered {len(_hooks)} attn1 hooks on down_blocks.")
+    return (
+        BATCH_SIZE,
+        COLLECT,
+        DDIM_STEPS,
+        IMG_SIZE,
+        PROMPT,
+        alphas_cumprod,
+        features_dict,
+        inv_timesteps,
+        prompt_embeds,
+        unet,
+        vae,
     )
-    return BATCH_SIZE, backbone, cfg, embedder
 
 
 @app.cell
@@ -160,12 +188,10 @@ def _():
         def __init__(self, database_embeddings: _torch.Tensor, type: Literal["l2", "ip"] = "ip"):
             self.database_embeddings = database_embeddings
             self.type = type
-
             if type == "ip":
                 self.index = faiss.IndexFlatIP(database_embeddings.shape[1])
             elif type == "l2":
                 self.index = faiss.IndexFlatL2(database_embeddings.shape[1])
-
             g_np = _np.ascontiguousarray(database_embeddings.detach().cpu().numpy().astype(_np.float32))
             self.index.add(g_np)
 
@@ -177,47 +203,96 @@ def _():
 
 
 @app.cell
-def _(DEVICE, DTYPE, DataLoader, F, backbone, embedder, time, torch, tqdm):
+def _(
+    COLLECT,
+    DEVICE,
+    DTYPE,
+    F,
+    alphas_cumprod,
+    features_dict,
+    inv_timesteps,
+    prompt_embeds,
+    time,
+    torch,
+    tqdm,
+    unet,
+    vae,
+):
+    def gem_pool(x: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
+        """GeM pooling: (B, C, H, W) → (B, C). Matches PoolConcatEmbedder."""
+        return F.avg_pool2d(x.clamp(min=eps).pow(p), x.shape[-2:]).pow(1.0 / p).flatten(1)
+
     @torch.inference_mode()
-    def extract_embeddings(loader: DataLoader) -> tuple[torch.Tensor, list[float], list[float], float]:
-        embeddings = []
+    def extract_embeddings(loader):
+        all_embs = []
         all_lats = []
         all_lons = []
+        max_step = max(COLLECT)
 
         t0 = time.perf_counter()
-        for imgs, lats, lons in tqdm(loader, desc="Building embeddings"):
+        pe_cache = None
+        for imgs, lats, lons in tqdm(loader, desc="Extracting"):
             imgs = imgs.to(DEVICE, dtype=DTYPE)
-            feats = backbone(imgs)
-            embs = embedder(feats)
-            embeddings.append(embs.cpu())
+            B = imgs.shape[0]
+
+            z = vae.encode(imgs).latent_dist.mode() * 0.18215
+            if pe_cache is None or pe_cache.shape[0] != B:
+                pe_cache = prompt_embeds.expand(B, -1, -1)
+
+            collected = []
+            for step_idx, t_curr in enumerate(inv_timesteps):
+                t_tensor = torch.tensor([t_curr] * B, device=DEVICE, dtype=torch.long)
+                features_dict.clear()
+                noise_pred = unet(z, t_tensor, encoder_hidden_states=pe_cache).sample
+
+                if step_idx in COLLECT:
+                    vecs = [gem_pool(features_dict[k]) for k in sorted(features_dict)]
+                    collected.append(torch.cat(vecs, dim=1).float())
+
+                if step_idx >= max_step:
+                    break
+
+                t_next = inv_timesteps[step_idx + 1]
+                a_t = alphas_cumprod[t_curr].to(z.dtype)
+                a_next = alphas_cumprod[t_next].to(z.dtype)
+                x0_pred = (z - (1 - a_t).sqrt() * noise_pred) / a_t.sqrt()
+                z = a_next.sqrt() * x0_pred + (1 - a_next).sqrt() * noise_pred
+
+            emb = F.normalize(torch.cat(collected, dim=1), dim=1)
+            all_embs.append(emb.cpu())
             all_lats.extend(lats)
             all_lons.extend(lons)
+
         elapsed = time.perf_counter() - t0
-
-        embeddings = torch.cat(embeddings, dim=0)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-
-        return embeddings, all_lats, all_lons, elapsed
+        return torch.cat(all_embs, dim=0), all_lats, all_lons, elapsed
 
     return (extract_embeddings,)
 
 
 @app.cell
-def _(BATCH_SIZE, DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, transforms, visloc_root):
+def _(
+    BATCH_SIZE,
+    DataLoader,
+    IMG_SIZE,
+    NUM_WORKERS,
+    SatChunkDataset,
+    UAVDataset,
+    transforms,
+    visloc_root,
+):
     FLIGHT_ID = "03"
-
     CHUNK_PIXELS = 512
     CHUNK_STRIDE = 128
     MAP_SCALE_FACTOR = 0.25
 
     inference_sat_transforms = transforms.Compose([
-        transforms.Resize((256, 256)),
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
     inference_uav_transforms = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop((256, 256)),
+        transforms.Resize(IMG_SIZE),
+        transforms.CenterCrop(IMG_SIZE),
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
@@ -230,21 +305,35 @@ def _(BATCH_SIZE, DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, transfor
         scale_factor=MAP_SCALE_FACTOR,
         transform=inference_sat_transforms,
     )
-    gallery_loader = DataLoader(gallery_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    gallery_loader = DataLoader(
+        gallery_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
 
     uav_dataset = UAVDataset(visloc_root, FLIGHT_ID, transform=inference_uav_transforms)
-    uav_loader = DataLoader(uav_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    uav_loader = DataLoader(
+        uav_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
 
-    # H-flip TTA loader for UAV queries
-    inference_uav_transforms_flip = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop((256, 256)),
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
     uav_loader_flip = DataLoader(
-        UAVDataset(visloc_root, FLIGHT_ID, transform=inference_uav_transforms_flip),
+        UAVDataset(
+            visloc_root,
+            FLIGHT_ID,
+            transform=transforms.Compose([
+                transforms.Resize(IMG_SIZE),
+                transforms.CenterCrop(IMG_SIZE),
+                transforms.RandomHorizontalFlip(p=1.0),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+            ]),
+        ),
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
@@ -267,7 +356,14 @@ def _(BATCH_SIZE, DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, transfor
 
 
 @app.cell
-def _(F, extract_embeddings, gallery_loader, time, uav_loader, uav_loader_flip):
+def _(
+    F,
+    extract_embeddings,
+    gallery_loader,
+    time,
+    uav_loader,
+    uav_loader_flip,
+):
     _t0 = time.perf_counter()
     gallery_embeddings_raw, _, _, _ = extract_embeddings(gallery_loader)
     t_gallery_embed = time.perf_counter() - _t0
@@ -276,17 +372,21 @@ def _(F, extract_embeddings, gallery_loader, time, uav_loader, uav_loader_flip):
     _query_orig, uav_lats, uav_lons, _ = extract_embeddings(uav_loader)
     print("Extracting UAV embeddings (h-flip TTA)...")
     _query_flip, _, _, _ = extract_embeddings(uav_loader_flip)
-    # Sum of two L2-normalised vectors, then renormalise (same as train.py TTA)
     query_embeddings_raw = F.normalize(_query_orig + _query_flip, p=2, dim=1)
-
-    return gallery_embeddings_raw, query_embeddings_raw, t_gallery_embed, uav_lats, uav_lons
+    return (
+        gallery_embeddings_raw,
+        query_embeddings_raw,
+        t_gallery_embed,
+        uav_lats,
+        uav_lons,
+    )
 
 
 @app.cell
 def _(F, gallery_embeddings_raw, np, query_embeddings_raw, torch):
     from sklearn.decomposition import PCA as _PCA
 
-    PCA_REMOVE = 16  # drop leading components that capture sensor/domain differences
+    PCA_REMOVE = 16
     PCA_KEEP = 1024
 
     _all_np = np.concatenate(
@@ -310,7 +410,7 @@ def _(F, gallery_embeddings_raw, np, query_embeddings_raw, torch):
         p=2,
         dim=1,
     )
-    print(f"PCA whitening: removed top {PCA_REMOVE} components, kept {PCA_KEEP} → {query_embeddings.shape[1]} dims")
+    print(f"PCA whitening: removed top {PCA_REMOVE}, kept {PCA_KEEP} → {query_embeddings.shape[1]} dims")
     return PCA_KEEP, PCA_REMOVE, gallery_embeddings, query_embeddings
 
 
@@ -319,7 +419,6 @@ def _(FAISSRetriever, gallery_embeddings, t_gallery_embed, time):
     _t0_idx = time.perf_counter()
     retriever = FAISSRetriever(gallery_embeddings)
     t_gallery_s = t_gallery_embed + (time.perf_counter() - _t0_idx)
-
     print(f"Gallery build: {t_gallery_s:.1f} s")
     return retriever, t_gallery_s
 
@@ -327,10 +426,14 @@ def _(FAISSRetriever, gallery_embeddings, t_gallery_embed, time):
 @app.cell
 def _(DEVICE, DataLoader, extract_embeddings, t_gallery_s, torch, uav_dataset):
     N_BENCH = 20
-    _bench_loader = DataLoader(torch.utils.data.Subset(uav_dataset, range(N_BENCH)), batch_size=1, shuffle=False, num_workers=0)
+    _bench_loader = DataLoader(
+        torch.utils.data.Subset(uav_dataset, range(N_BENCH)),
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+    )
 
-    # warm up
-    extract_embeddings(_bench_loader)
+    extract_embeddings(_bench_loader)  # warm up
 
     if DEVICE.type == "cuda":
         torch.cuda.reset_peak_memory_stats(DEVICE)
@@ -347,9 +450,7 @@ def _(DEVICE, DataLoader, extract_embeddings, t_gallery_s, torch, uav_dataset):
         "inference_ms_per_sample": _ms_per_sample,
         "vram_mb_peak_1sample": _vram_mb,
     }
-
     print(perf_metrics)
-
     return (perf_metrics,)
 
 
@@ -364,25 +465,25 @@ def _(
     uav_lons,
 ):
     uav_coords = np.stack([uav_lats, uav_lons], axis=1)
-
     _distances, preds = retriever.search(query_embeddings, k=10)
-
     metrics = calculate_metrics(preds, uav_coords, gallery_dataset.chunk_bboxes)
-
     print(metrics)
-
     return (metrics,)
 
 
 @app.cell
 def _(
+    BATCH_SIZE,
     CHUNK_PIXELS,
     CHUNK_STRIDE,
+    COLLECT,
+    DDIM_STEPS,
     FLIGHT_ID,
+    IMG_SIZE,
     MAP_SCALE_FACTOR,
     PCA_KEEP,
     PCA_REMOVE,
-    cfg,
+    PROMPT,
     gallery_dataset,
     gallery_embeddings,
     metrics,
@@ -391,13 +492,16 @@ def _(
     uav_dataset,
 ):
     entry = {
-        "model": "sd2-community/stable-diffusion-2-1",
+        "model": "diffusionsat-direct-extraction",
         "model_extra": {
-            "embedder": "PoolConcatEmbedder",
+            "img_size": IMG_SIZE,
+            "ddim_steps": DDIM_STEPS,
+            "collect": sorted(COLLECT),
+            "prompt": PROMPT,
             "tta_hflip": True,
             "pca_remove": PCA_REMOVE,
             "pca_keep": PCA_KEEP,
-            **dict(cfg.__dict__.items()),
+            "batch_size": BATCH_SIZE,
         },
         "dataset": "visloc",
         "dataset_extra": {
@@ -413,7 +517,6 @@ def _(
         **metrics,
         **perf_metrics,
     }
-
     entry
     return (entry,)
 
@@ -422,11 +525,9 @@ def _(
 def _(entry, pd, project_root):
     results_path = project_root / "out/zeroshot-comparison.tsv"
     results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
-
     key_cols = ["model", "model_extra", "dataset", "dataset_extra"]
     results = [r for r in results if not all(str(r.get(k)) == str(entry.get(k)) for k in key_cols)]
     results.append(entry)
-
     pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)
     return
 
