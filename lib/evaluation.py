@@ -50,19 +50,21 @@ def build_ground_truth(
     return ground_truth
 
 
-def distance_at_1(
+def distance_at_k(
     preds: np.ndarray,
     uav_coords: np.ndarray,
     chunk_bboxes: list[tuple[float, float, float, float]],
+    k: int,
 ) -> float:
-    """Mean flat-earth distance in metres from each query to its top-1 retrieved chunk centre."""
+    """Mean minimum flat-earth distance (metres) from each query to its closest top-k chunk centre."""
     bboxes = np.array(chunk_bboxes)
     center_lats = (bboxes[:, 0] + bboxes[:, 2]) / 2
     center_lons = (bboxes[:, 1] + bboxes[:, 3]) / 2
-    dists = [
-        flat_earth_dist_m(lat, lon, center_lats[[preds[i, 0]]], center_lons[[preds[i, 0]]])[0] for i, (lat, lon) in enumerate(uav_coords)
+    min_dists = [
+        float(np.min(flat_earth_dist_m(lat, lon, center_lats[preds[i, :k]], center_lons[preds[i, :k]])))
+        for i, (lat, lon) in enumerate(uav_coords)
     ]
-    return float(np.mean(dists))
+    return float(np.mean(min_dists))
 
 
 def recall_at_k(preds: np.ndarray, ground_truth: list[list[int]], k: int) -> float:
@@ -71,12 +73,20 @@ def recall_at_k(preds: np.ndarray, ground_truth: list[list[int]], k: int) -> flo
     return hits / len(ground_truth)
 
 
-def calculate_metrics(preds: np.ndarray, ground_truth: list[list[int]]) -> dict[str, float]:
-    """Compute Recall@1, Recall@5, and Recall@10."""
+def calculate_metrics(
+    preds: np.ndarray,
+    uav_coords: np.ndarray,
+    chunk_bboxes: list[tuple[float, float, float, float]],
+) -> dict[str, float]:
+    """Compute Recall@1/5/10 (bbox-based) and Dis@1/5/10 (min distance among top-k)."""
+    ground_truth = build_ground_truth(uav_coords, chunk_bboxes)
     return {
         "Recall@1": recall_at_k(preds, ground_truth, k=1),
         "Recall@5": recall_at_k(preds, ground_truth, k=5),
         "Recall@10": recall_at_k(preds, ground_truth, k=10),
+        "Dis@1": distance_at_k(preds, uav_coords, chunk_bboxes, k=1),
+        "Dis@5": distance_at_k(preds, uav_coords, chunk_bboxes, k=5),
+        "Dis@10": distance_at_k(preds, uav_coords, chunk_bboxes, k=10),
     }
 
 
