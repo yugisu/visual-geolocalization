@@ -50,6 +50,21 @@ def build_ground_truth(
     return ground_truth
 
 
+def distance_at_1(
+    preds: np.ndarray,
+    uav_coords: np.ndarray,
+    chunk_bboxes: list[tuple[float, float, float, float]],
+) -> float:
+    """Mean flat-earth distance in metres from each query to its top-1 retrieved chunk centre."""
+    bboxes = np.array(chunk_bboxes)
+    center_lats = (bboxes[:, 0] + bboxes[:, 2]) / 2
+    center_lons = (bboxes[:, 1] + bboxes[:, 3]) / 2
+    dists = [
+        flat_earth_dist_m(lat, lon, center_lats[[preds[i, 0]]], center_lons[[preds[i, 0]]])[0] for i, (lat, lon) in enumerate(uav_coords)
+    ]
+    return float(np.mean(dists))
+
+
 def recall_at_k(preds: np.ndarray, ground_truth: list[list[int]], k: int) -> float:
     """Fraction of queries where any ground-truth chunk appears in the top-k predictions."""
     hits = sum(any(p in gt for p in preds[i, :k]) for i, gt in enumerate(ground_truth))

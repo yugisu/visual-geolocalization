@@ -8,8 +8,8 @@
       "Bash(uv *)",
       "Bash(git log*)",
       "Bash(git status*)",
-      "Read(../diffusion-vpr/*)",
-      "Read(../diffusion-autoresearch/*)",
+      "Read(**/diffusion-vpr/*)",
+      "Read(**/diffusion-autoresearch/*)",
       "WebSearch",
       "WebFetch(domain:docs.marimo.io)"
     ],
