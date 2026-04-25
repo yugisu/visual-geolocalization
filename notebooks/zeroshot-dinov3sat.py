@@ -24,6 +24,7 @@ app = marimo.App(width="medium")
 def _():
     import sys
     import os
+    import time
     import warnings
     from pathlib import Path
 
@@ -39,7 +40,7 @@ def _():
     sys.path.insert(0, str(project_root))
 
     from lib.visloc import SatChunkDataset, UAVDataset
-    from lib.evaluation import build_ground_truth, calculate_metrics
+    from lib.evaluation import build_ground_truth, calculate_metrics, distance_at_1
 
     load_dotenv(project_root / ".env")
     data_root = Path(os.environ["DATA_ROOT"])
@@ -58,9 +59,11 @@ def _():
         UAVDataset,
         build_ground_truth,
         calculate_metrics,
+        distance_at_1,
         np,
         pd,
         project_root,
+        time,
         torch,
         tqdm,
         visloc_root,
@@ -79,32 +82,6 @@ def _(DEVICE):
     embedder = model
     preprocess = processor
     return embedder, preprocess
-
-
-@app.cell
-def _(DEVICE, DataLoader, F, embedder, preprocess, torch, tqdm):
-    @torch.inference_mode()
-    def extract_embeddings(loader: DataLoader) -> tuple[torch.Tensor, list[float], list[float]]:
-        embeddings = []
-        all_lats = []
-        all_lons = []
-
-        for imgs, lats, lons in tqdm(loader, desc="Building embeddings"):
-            imgs = imgs.to(DEVICE)
-            inputs = preprocess(imgs, return_tensors="pt").to(DEVICE)
-
-            embs = embedder(**inputs).pooler_output
-
-            embeddings.append(embs.cpu())
-            all_lats.extend(lats)
-            all_lons.extend(lons)
-
-        embeddings = torch.cat(embeddings, dim=0)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-
-        return embeddings, all_lats, all_lons
-
-    return (extract_embeddings,)
 
 
 @app.cell
@@ -137,6 +114,32 @@ def _():
 
 
 @app.cell
+def _(DEVICE, DataLoader, F, embedder, preprocess, time, torch, tqdm):
+    @torch.inference_mode()
+    def extract_embeddings(loader: DataLoader) -> tuple[torch.Tensor, list[float], list[float], float]:
+        embeddings = []
+        all_lats = []
+        all_lons = []
+
+        t0 = time.perf_counter()
+        for imgs, lats, lons in tqdm(loader, desc="Building embeddings"):
+            imgs = imgs.to(DEVICE)
+            inputs = preprocess(imgs, return_tensors="pt").to(DEVICE)
+            embs = embedder(**inputs).last_hidden_state[:, 0]
+            embeddings.append(embs.cpu())
+            all_lats.extend(lats)
+            all_lons.extend(lons)
+        elapsed = time.perf_counter() - t0
+
+        embeddings = torch.cat(embeddings, dim=0)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+
+        return embeddings, all_lats, all_lons, elapsed
+
+    return (extract_embeddings,)
+
+
+@app.cell
 def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, np, visloc_root):
     FLIGHT_ID = "03"
 
@@ -165,6 +168,7 @@ def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, np, visloc_root):
     print(f"Gallery: {len(gallery_dataset)} satellite chunks")
     print(f"Query:   {len(uav_dataset)} UAV images")
     return (
+        BATCH_SIZE,
         CHUNK_PIXELS,
         CHUNK_STRIDE,
         FLIGHT_ID,
@@ -177,21 +181,47 @@ def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, np, visloc_root):
 
 
 @app.cell
-def _(extract_embeddings, gallery_loader, uav_loader):
-    gallery_embeddings, _, _ = extract_embeddings(gallery_loader)
-    query_embeddings, uav_lats, uav_lons = extract_embeddings(uav_loader)
-    return gallery_embeddings, query_embeddings, uav_lats, uav_lons
+def _(FAISSRetriever, extract_embeddings, gallery_loader, time, uav_loader):
+    gallery_embeddings, _, _, t_gallery_embed = extract_embeddings(gallery_loader)
+    query_embeddings, uav_lats, uav_lons, _ = extract_embeddings(uav_loader)
+
+    t0_idx = time.perf_counter()
+    retriever = FAISSRetriever(gallery_embeddings)
+    t_gallery_s = t_gallery_embed + (time.perf_counter() - t0_idx)
+
+    print(f"Gallery build: {t_gallery_s:.1f} s")
+    return gallery_embeddings, query_embeddings, retriever, t_gallery_s, uav_lats, uav_lons
+
+
+@app.cell
+def _(DEVICE, DataLoader, extract_embeddings, torch, uav_dataset):
+    N_BENCH = 20
+    _bench_loader = DataLoader(torch.utils.data.Subset(uav_dataset, range(N_BENCH)), batch_size=1, shuffle=False, num_workers=0)
+
+    # warm up
+    extract_embeddings(_bench_loader)
+
+    if DEVICE.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+
+    _, _, _, _elapsed = extract_embeddings(_bench_loader)
+
+    vram_mb = torch.cuda.max_memory_allocated(DEVICE) / 1024**2 if DEVICE.type == "cuda" else float("nan")
+    ms_per_sample = _elapsed / N_BENCH * 1000
+
+    print(f"Inference: {ms_per_sample:.2f} ms/sample  |  VRAM peak: {vram_mb:.1f} MB")
+    return ms_per_sample, vram_mb
 
 
 @app.cell
 def _(
-    FAISSRetriever,
     build_ground_truth,
     calculate_metrics,
+    distance_at_1,
     gallery_dataset,
-    gallery_embeddings,
     np,
     query_embeddings,
+    retriever,
     uav_lats,
     uav_lons,
 ):
@@ -200,13 +230,14 @@ def _(
 
     print(f"{len(ground_truth)} UAV queries, avg {np.mean([len(gt) for gt in ground_truth]):.1f} matching chunks each")
 
-    retriever = FAISSRetriever(gallery_embeddings)
     _distances, preds = retriever.search(query_embeddings, k=10)
 
     metrics = calculate_metrics(preds, ground_truth)
 
-    print(metrics)
-    return metrics, retriever
+    dis_at_1 = distance_at_1(preds, uav_coords, gallery_dataset.chunk_bboxes)
+
+    print({**metrics, "Dis@1": f"{dis_at_1:.1f} m"})
+    return dis_at_1, ground_truth, metrics
 
 
 @app.cell
@@ -215,11 +246,15 @@ def _(
     CHUNK_STRIDE,
     FLIGHT_ID,
     MAP_SCALE_FACTOR,
+    dis_at_1,
     gallery_dataset,
     gallery_embeddings,
     metrics,
+    ms_per_sample,
     retriever,
+    t_gallery_s,
     uav_dataset,
+    vram_mb,
 ):
     entry = {
         "model": "facebook/dinov3-vitl16-pretrain-sat493m",
@@ -236,6 +271,10 @@ def _(
         "n_query": len(uav_dataset),
         "retriever_type": retriever.type,
         **metrics,
+        "Dis@1_m": dis_at_1,
+        "gallery_build_s": t_gallery_s,
+        "inference_ms_per_sample": ms_per_sample,
+        "vram_mb_peak_1sample": vram_mb,
     }
 
     entry
@@ -244,7 +283,7 @@ def _(
 
 @app.cell
 def _(entry, pd, project_root):
-    results_path = project_root / "out/1-baseline-comparison.csv"
+    results_path = project_root / "out/zeroshot-comparison.csv"
     results = pd.read_csv(results_path).to_dict(orient="records") if results_path.exists() else []
 
     results.append(entry)
