@@ -283,14 +283,7 @@ def _(entry, pd, project_root):
 
     results.append(entry)
 
-    pd.sort_values(
-        "Recall@1",
-        ascending=False,
-    ).to_csv(
-        results_path,
-        sep="\t",
-        index=False,
-    )
+    pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)
     return
 
 
