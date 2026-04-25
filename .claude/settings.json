@@ -13,7 +13,8 @@
       "Read(**/diffusion-autoresearch/*)",
       "WebSearch",
       "WebFetch(domain:docs.marimo.io)",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Read(//root/diffusion-autoresearch/**)"
     ],
     "deny": [
       "Read(*.env)",
@@ -24,6 +25,9 @@
       "Bash(gh pr create:*)",
       "Bash(git commit:*)"
     ],
-    "defaultMode": "default"
+    "defaultMode": "default",
+    "additionalDirectories": [
+      "/root/diffusion-autoresearch"
+    ]
   }
 }

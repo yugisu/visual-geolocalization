@@ -3,18 +3,28 @@
 # dependencies = [
 #     "marimo",
 #     "python-dotenv==1.2.2",
-#     "numpy==2.2.6",
+#     "setuptools<81",
+#     "numpy==1.26.3",
+#     "diffusers==0.17.0",
+#     "torch==2.2.2",
+#     "torchvision==0.17.2",
+#     "accelerate==0.18.0",
+#     "transformers==4.40.0",
+#     "scikit-learn==1.5.2",
+#     "huggingface_hub==0.19.3",
+#     "h5py==3.11.0",
+#     "einops>=0.8.2",
 #     "pandas==2.3.3",
-#     "torch==2.3.1",
-#     "torchvision==0.18.1",
-#     "diffusers>=0.27.0",
-#     "accelerate>=0.29.0",
-#     "transformers>=4.40.0",
-#     "opencv-python>=4.9.0",
 #     "faiss-cpu>=1.7.4",
 #     "tqdm==4.67.3",
 #     "rasterio==1.4.4",
+#     "satdifuser",
+#     "diffusion-vpr",
 # ]
+#
+# [tool.uv.sources]
+# satdifuser = { path = "../../SatDiFuser", editable = true }
+# diffusion-vpr = { path = "../../diffusion-vpr", editable = true }
 # ///
 
 import marimo
@@ -355,6 +365,8 @@ def _(entry, pd, project_root):
     results_path = project_root / "out/zeroshot-comparison.tsv"
     results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
 
+    key_cols = ["model", "model_extra", "dataset", "dataset_extra"]
+    results = [r for r in results if not all(str(r.get(k)) == str(entry.get(k)) for k in key_cols)]
     results.append(entry)
 
     pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)

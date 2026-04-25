@@ -3,17 +3,28 @@
 # dependencies = [
 #     "marimo",
 #     "python-dotenv==1.2.2",
-#     "numpy==2.2.6",
+#     "setuptools<81",
+#     "numpy==1.26.3",
+#     "diffusers==0.17.0",
+#     "torch==2.2.2",
+#     "torchvision==0.17.2",
+#     "accelerate==0.18.0",
+#     "transformers==4.40.0",
+#     "scikit-learn==1.5.2",
+#     "huggingface_hub==0.19.3",
+#     "h5py==3.11.0",
+#     "einops>=0.8.2",
 #     "pandas==2.3.3",
-#     "torch==2.3.1",
-#     "torchvision==0.18.1",
-#     "diffusers>=0.27.0",
-#     "accelerate>=0.29.0",
-#     "transformers>=4.40.0",
 #     "faiss-cpu>=1.7.4",
 #     "tqdm==4.67.3",
 #     "rasterio==1.4.4",
+#     "satdifuser",
+#     "diffusion-vpr",
 # ]
+#
+# [tool.uv.sources]
+# satdifuser = { path = "../../SatDiFuser", editable = true }
+# diffusion-vpr = { path = "../../diffusion-vpr", editable = true }
 # ///
 
 import marimo
@@ -45,13 +56,16 @@ def _():
     diffusion_vpr_root = project_root.parent / "diffusion-vpr"
     sys.path.insert(0, str(diffusion_vpr_root))
 
+    satdifuser_root = project_root.parent / "SatDiFuser"
+    sys.path.insert(0, str(satdifuser_root))
+
     from lib.visloc import SatChunkDataset, UAVDataset
     from lib.evaluation import calculate_metrics
 
     load_dotenv(project_root / ".env")
     data_root = Path(os.environ["DATA_ROOT"])
     visloc_root = data_root / "visloc"
-    diffusionsat_256_chckpt = Path(os.environ["DIFFUSIONSAT_256_CHCKPT"])
+    diffusionsat_256_chckpt = Path(os.environ["CHECKPOINTS_ROOT"]) / "finetune_sd21_256_sn-satlas-fmow_snr5_md7norm_bs64_trimmed"
 
     warnings.filterwarnings("ignore", message=".*invalid escape sequence.*")
 
@@ -170,21 +184,17 @@ def _(BATCH_SIZE, DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, transfor
     CHUNK_STRIDE = 128
     MAP_SCALE_FACTOR = 0.25
 
-    inference_sat_transforms = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ]
-    )
-    inference_uav_transforms = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop((256, 256)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ]
-    )
+    inference_sat_transforms = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    inference_uav_transforms = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
 
     gallery_dataset = SatChunkDataset(
         visloc_root,
@@ -320,6 +330,8 @@ def _(entry, pd, project_root):
     results_path = project_root / "out/zeroshot-comparison.tsv"
     results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
 
+    key_cols = ["model", "model_extra", "dataset", "dataset_extra"]
+    results = [r for r in results if not all(str(r.get(k)) == str(entry.get(k)) for k in key_cols)]
     results.append(entry)
 
     pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)

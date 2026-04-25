@@ -72,8 +72,8 @@ def _():
 def _(DEVICE):
     from transformers import AutoImageProcessor, AutoModel
 
-    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m")
-    model = AutoModel.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m")
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
+    model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-sat493m")
 
     model = model.to(DEVICE).eval()
 
@@ -143,9 +143,9 @@ def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, np, visloc_root):
 
     BATCH_SIZE = 128
 
-    CHUNK_PIXELS = 256
-    CHUNK_STRIDE = CHUNK_PIXELS // 4
-    MAP_SCALE_FACTOR = 0.125
+    CHUNK_PIXELS = 512
+    CHUNK_STRIDE = 128
+    MAP_SCALE_FACTOR = 0.25
 
     def inference_transforms(img):
         return np.array(img)
@@ -255,7 +255,7 @@ def _(
     uav_dataset,
 ):
     entry = {
-        "model": "facebook/dinov3-vitb16-pretrain-lvd1689m",
+        "model": "facebook/dinov3-vitl16-pretrain-sat493m",
         "model_extra": {},
         "dataset": "visloc",
         "dataset_extra": {
@@ -281,6 +281,8 @@ def _(entry, pd, project_root):
     results_path = project_root / "out/zeroshot-comparison.tsv"
     results = pd.read_csv(results_path, sep="\t").to_dict(orient="records") if results_path.exists() else []
 
+    key_cols = ["model", "model_extra", "dataset", "dataset_extra"]
+    results = [r for r in results if not all(str(r.get(k)) == str(entry.get(k)) for k in key_cols)]
     results.append(entry)
 
     pd.DataFrame(results).sort_values("Recall@1", ascending=False).to_csv(results_path, sep="\t", index=False)

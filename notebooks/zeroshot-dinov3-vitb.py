@@ -7,9 +7,6 @@
 #     "pandas==2.3.3",
 #     "torch==2.3.1",
 #     "torchvision==0.18.1",
-#     "open_clip_torch>=2.24.0",
-#     "huggingface_hub>=0.23.0",
-#     "safetensors>=0.4.0",
 #     "transformers==4.56.0",
 #     "faiss-cpu>=1.7.4",
 #     "tqdm==4.67.3",
@@ -73,44 +70,15 @@ def _():
 
 @app.cell
 def _(DEVICE):
-    import open_clip
-    import torch.nn as nn
-    from huggingface_hub import hf_hub_download
-    from safetensors.torch import load_file
-    from transformers import PretrainedConfig
-    from huggingface_hub import PyTorchModelHubMixin
+    from transformers import AutoImageProcessor, AutoModel
 
-    # SRC: https://github.com/mvrl/rshf/tree/main/rshf/remoteclip
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m")
+    model = AutoModel.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m")
 
-    class RemoteCLIPConfig(PretrainedConfig):
-        def __init__(self, model_name="ViT-B-32", **kwargs):
-            super().__init__(**kwargs)
-            self.model_name = model_name
-
-        def from_dict(self, config_dict):  # ty:ignore[invalid-method-override]
-            for key, value in config_dict.items():
-                setattr(self, key, value)
-            return self
-
-    class RemoteCLIP(nn.Module, PyTorchModelHubMixin):
-        def __init__(self, config: PretrainedConfig | None = None, model_name="ViT-B-32"):
-            super().__init__()
-            if config is not None:
-                if type(config) is dict:
-                    config = RemoteCLIPConfig().from_dict(config)
-                model_name = config.model_name
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name)
-            self.tokenizer = open_clip.get_tokenizer(model_name)
-
-    checkpoint_path = hf_hub_download("MVRL/remote-clip-vit-base-patch32", "model.safetensors")
-    state_dict = load_file(checkpoint_path)
-
-    model = RemoteCLIP(model_name="ViT-B-32")
-    model.load_state_dict(state_dict)
     model = model.to(DEVICE).eval()
 
-    embedder = model.model.visual
-    preprocess = model.preprocess
+    embedder = model
+    preprocess = processor
     return embedder, preprocess
 
 
@@ -144,7 +112,7 @@ def _():
 
 
 @app.cell
-def _(DEVICE, DataLoader, F, embedder, time, torch, tqdm):
+def _(DEVICE, DataLoader, F, embedder, preprocess, time, torch, tqdm):
     @torch.inference_mode()
     def extract_embeddings(loader: DataLoader) -> tuple[torch.Tensor, list[float], list[float], float]:
         embeddings = []
@@ -154,7 +122,8 @@ def _(DEVICE, DataLoader, F, embedder, time, torch, tqdm):
         t0 = time.perf_counter()
         for imgs, lats, lons in tqdm(loader, desc="Building embeddings"):
             imgs = imgs.to(DEVICE)
-            embs = embedder(imgs)
+            inputs = preprocess(imgs, return_tensors="pt").to(DEVICE)
+            embs = embedder(**inputs).last_hidden_state[:, 0]
             embeddings.append(embs.cpu())
             all_lats.extend(lats)
             all_lons.extend(lons)
@@ -169,17 +138,17 @@ def _(DEVICE, DataLoader, F, embedder, time, torch, tqdm):
 
 
 @app.cell
-def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, preprocess, visloc_root):
+def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, np, visloc_root):
     FLIGHT_ID = "03"
 
-    BATCH_SIZE = 256
+    BATCH_SIZE = 128
 
-    CHUNK_PIXELS = 512
-    CHUNK_STRIDE = 128
-    MAP_SCALE_FACTOR = 0.25
+    CHUNK_PIXELS = 256
+    CHUNK_STRIDE = CHUNK_PIXELS // 4
+    MAP_SCALE_FACTOR = 0.125
 
-    inference_sat_transforms = preprocess
-    inference_uav_transforms = preprocess
+    def inference_transforms(img):
+        return np.array(img)
 
     gallery_dataset = SatChunkDataset(
         visloc_root,
@@ -187,11 +156,11 @@ def _(DataLoader, NUM_WORKERS, SatChunkDataset, UAVDataset, preprocess, visloc_r
         chunk_pixels=CHUNK_PIXELS,
         stride_pixels=CHUNK_STRIDE,
         scale_factor=MAP_SCALE_FACTOR,
-        transform=inference_sat_transforms,
+        transform=inference_transforms,
     )
     gallery_loader = DataLoader(gallery_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-    uav_dataset = UAVDataset(visloc_root, FLIGHT_ID, transform=inference_uav_transforms)
+    uav_dataset = UAVDataset(visloc_root, FLIGHT_ID, transform=inference_transforms)
     uav_loader = DataLoader(uav_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     print(f"Gallery: {len(gallery_dataset)} satellite chunks")
@@ -286,7 +255,7 @@ def _(
     uav_dataset,
 ):
     entry = {
-        "model": "MVRL/remote-clip-vit-base-patch32",
+        "model": "facebook/dinov3-vitb16-pretrain-lvd1689m",
         "model_extra": {},
         "dataset": "visloc",
         "dataset_extra": {
