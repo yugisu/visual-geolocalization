@@ -283,9 +283,7 @@ def _(entry, pd, project_root):
 
     results.append(entry)
 
-    pd.DataFrame(results).drop_duplicates(
-        subset=["model", "model_extra", "dataset", "dataset_extra", "retriever_type"],
-    ).sort_values(
+    pd.sort_values(
         "Recall@1",
         ascending=False,
     ).to_csv(
