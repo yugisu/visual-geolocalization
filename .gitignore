@@ -12,5 +12,6 @@ wheels/
 .env
 data/
 checkpoints/
+third_party/
 
 __marimo__/
