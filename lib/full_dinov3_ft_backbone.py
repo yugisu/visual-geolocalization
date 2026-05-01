@@ -31,6 +31,7 @@ from transformers import AutoModel
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 DEFAULT_CHECKPOINT = "dinov3-ssl4eos12-visloc-smoothap-r@1=0.85-1c95460.ckpt"
+DEFAULT_SUPERVISED_CHECKPOINT = "dinov3-visloc-smoothap-r@1=0.80-1c95460.ckpt"
 
 
 class DINOv3Retriever(nn.Module):
@@ -144,18 +145,18 @@ class DINOv3Retriever(nn.Module):
             batch_size:   encoding chunk size to avoid OOM on large galleries
 
         Returns:
-            sims [N_q, N_g] — higher = better match
-            ranked indices: np.argsort(-sims, axis=1)
+            preds [N_q, N_g] — ranked indices: np.argsort(-sims, axis=1)
         """
         q_embs, q_patches = self._encode_batched(query_imgs, tta=tta, batch_size=batch_size)
         g_embs, g_patches = self._encode_batched(gallery_imgs, tta=tta, batch_size=batch_size)
 
         sims = (q_embs @ g_embs.t()).cpu().numpy().astype(np.float32)
+        preds = np.argsort(-sims, axis=1)
 
         if patch_rerank:
-            sims = self._chamfer_rerank(sims, q_patches, g_patches, K=K, alpha=alpha)
+            preds[:, :K] = chamfer_rerank(sims, q_patches, g_patches, K=K, alpha=alpha)
 
-        return sims
+        return preds
 
     # ------------------------------------------------------------------
     # Helpers
@@ -174,21 +175,59 @@ class DINOv3Retriever(nn.Module):
             patches.append(p)
         return torch.cat(embs), torch.cat(patches)
 
-    def _chamfer_rerank(
-        self,
-        sims: np.ndarray,
-        q_patches: torch.Tensor,
-        g_patches: torch.Tensor,
-        K: int,
-        alpha: float,
-    ) -> np.ndarray:
-        """Per-query chamfer similarity between patch tokens over top-K candidates."""
-        sims = sims.copy()
-        for i in range(len(sims)):
-            top_k = np.argsort(-sims[i])[:K]
-            uav_p = q_patches[i]  # [P, D]
-            sat_k = g_patches[top_k]  # [K, P, D]
-            sim_mat = uav_p.unsqueeze(0) @ sat_k.transpose(-1, -2)  # [K, P, P]
-            patch_sims = sim_mat.max(dim=2).values.mean(dim=1).cpu().numpy()  # [K]
-            sims[i, top_k] = alpha * sims[i, top_k] + (1 - alpha) * patch_sims
-        return sims
+
+
+def chamfer_rerank(
+    sims: np.ndarray,
+    q_patches: torch.Tensor,
+    g_patches: torch.Tensor,
+    K: int,
+    alpha: float,
+    batch_size: int = 32,
+    device: str | torch.device | None = None,
+) -> np.ndarray:
+    """
+    Vectorized and batched Chamfer similarity reranking over top-K candidates.
+
+    Args:
+        sims: [N_q, N_g] global similarity matrix.
+        q_patches: [N_q, P, D] patch embeddings for queries.
+        g_patches: [N_g, P, D] patch embeddings for gallery.
+        K: number of top candidates to rerank.
+        alpha: weight for blending global and patch similarity.
+        batch_size: query batch size to prevent OOM during [N_q, K, P, P] computation.
+        device: device to run the batched matrix multiplications on. 
+                Defaults to "cuda" if available, else CPU.
+                
+    Returns:
+        [N_q, K] array of reranked gallery indices.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+
+    N_q = len(sims)
+    preds = np.argsort(-sims, axis=1)[:, :K]
+    new_preds = np.zeros_like(preds)
+    
+    top_k_tensor = torch.from_numpy(preds)
+    
+    for i in range(0, N_q, batch_size):
+        end = min(i + batch_size, N_q)
+        q_p = q_patches[i:end].to(device).unsqueeze(1)  # [B, 1, P, D]
+        g_p_chunk = g_patches[top_k_tensor[i:end]].to(device) # [B, K, P, D]
+        
+        sim_mat = q_p @ g_p_chunk.transpose(-1, -2)  # [B, K, P_q, P_g]
+        patch_sims = sim_mat.max(dim=-1).values.mean(dim=-1)  # [B, K]
+        
+        idx_b = np.arange(i, end)[:, None]
+        k_idx_b = preds[i:end]
+        global_sims = sims[idx_b, k_idx_b]
+        
+        blended_sims = alpha * global_sims + (1 - alpha) * patch_sims.cpu().numpy()
+        
+        sort_idx = np.argsort(-blended_sims, axis=1)  # [B, K]
+        new_preds[i:end] = np.take_along_axis(preds[i:end], sort_idx, axis=1)
+        
+    return new_preds

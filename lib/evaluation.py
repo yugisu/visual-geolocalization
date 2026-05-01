@@ -74,11 +74,17 @@ def distance_at_k(
     bboxes = np.array(chunk_bboxes)
     center_lats = (bboxes[:, 0] + bboxes[:, 2]) / 2
     center_lons = (bboxes[:, 1] + bboxes[:, 3]) / 2
-    min_dists = [
-        float(np.min(flat_earth_dist_m(lat, lon, center_lats[preds[i, :k]], center_lons[preds[i, :k]])))
-        for i, (lat, lon) in enumerate(uav_coords)
-    ]
-    return float(np.mean(min_dists))
+
+    q_lats = uav_coords[:, 0, np.newaxis]
+    q_lons = uav_coords[:, 1, np.newaxis]
+    p_lats = center_lats[preds[:, :k]]
+    p_lons = center_lons[preds[:, :k]]
+
+    dlat = (p_lats - q_lats) * 111_111
+    dlon = (p_lons - q_lons) * 111_111 * np.cos(np.radians(q_lats))
+    dists = np.sqrt(dlat**2 + dlon**2)
+
+    return float(np.mean(np.min(dists, axis=1)))
 
 
 def recall_at_k(preds: np.ndarray, ground_truth: list[list[int]], k: int) -> float:

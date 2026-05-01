@@ -20,7 +20,7 @@ __generated_with = "0.23.4"
 app = marimo.App(width="medium")
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     import sys
     import os
@@ -42,7 +42,7 @@ def _():
 
     from lib.visloc import SatChunkDataset, UAVDataset
     from lib.evaluation import calculate_metrics
-    from lib.full_dinov3_ft_backbone import DINOv3Retriever, DINO_MODEL, DEFAULT_CHECKPOINT
+    from lib.full_dinov3_ft_backbone import DINOv3Retriever, DINO_MODEL, DEFAULT_CHECKPOINT, chamfer_rerank
 
     load_dotenv(project_root / ".env")
 
@@ -68,6 +68,7 @@ def _():
         SatChunkDataset,
         UAVDataset,
         calculate_metrics,
+        chamfer_rerank,
         ckpt_path,
         np,
         pd,
@@ -80,7 +81,7 @@ def _():
     )
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(DEVICE, DINO_MODEL, DINOv3Retriever, ckpt_path):
     from transformers import AutoImageProcessor
 
@@ -94,7 +95,7 @@ def _(DEVICE, DINO_MODEL, DINOv3Retriever, ckpt_path):
     return embedder, processor
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(DEVICE, DataLoader, F, embedder, time, torch, tqdm):
     @torch.inference_mode()
     def extract_embeddings(
@@ -139,6 +140,9 @@ def _(
     transforms,
     visloc_root,
 ):
+    TTA = True
+    PATCH_RERANK = True
+
     FLIGHT_ID = "03"
 
     BATCH_SIZE = 128
@@ -146,8 +150,6 @@ def _(
     CHUNK_PIXELS = 512
     CHUNK_STRIDE = CHUNK_PIXELS // 4
     MAP_SCALE_FACTOR = 0.25
-    TTA = True
-    PATCH_RERANK = True
     RERANK_TOPK = 50
     RERANK_ALPHA = 0.5
 
@@ -198,7 +200,7 @@ def _(
     RERANK_ALPHA,
     RERANK_TOPK,
     TTA,
-    embedder,
+    chamfer_rerank,
     extract_embeddings,
     gallery_loader,
     np,
@@ -218,8 +220,10 @@ def _(
 
     t0_retrieve = time.perf_counter()
     sims = (query_embeddings @ gallery_embeddings.T).cpu().numpy().astype(np.float32)
+    preds = np.argsort(-sims, axis=1)
+
     if PATCH_RERANK:
-        sims = embedder._chamfer_rerank(
+        preds = chamfer_rerank(
             sims,
             query_patches,
             gallery_patches,
@@ -228,7 +232,7 @@ def _(
         )
     t_retrieve = time.perf_counter() - t0_retrieve
 
-    preds = np.argsort(-sims, axis=1)[:, :10]
+    preds = preds[:, :10]
     t_gallery_s = t_gallery_embed
     retriever_type = "ip+tta+patch-rerank" if PATCH_RERANK else "ip+tta"
 
@@ -236,8 +240,10 @@ def _(
     print(f"Retrieval compute: {t_retrieve:.2f} s")
     return (
         gallery_embeddings,
+        gallery_patches,
         preds,
         query_embeddings,
+        query_patches,
         retriever_type,
         t_gallery_s,
         uav_lats,
@@ -345,15 +351,37 @@ def _(entry, pd, project_root):
 
 
 @app.cell
-def _(gallery_embeddings, np, project_root, query_embeddings):
+def _(
+    TTA,
+    gallery_embeddings,
+    gallery_patches,
+    np,
+    project_root,
+    query_embeddings,
+    query_patches,
+):
     emb_dir = project_root / "embeddings"
     emb_dir.mkdir(parents=True, exist_ok=True)
 
-    gallery_path = emb_dir / "ft-dinov3-vitb-ssl4eo_ch-visloc-emb-gallery.npy"
-    query_path = emb_dir / "ft-dinov3-vitb-ssl4eo_ch-visloc-emb-query.npy"
+    base_name = "ft-dinov3-vitb-ssl4eo_ch-visloc"
+
+    if TTA:
+        base_name += "-tta"
+
+    gallery_path = emb_dir / f"{base_name}-emb-gallery.npy"
+    query_path = emb_dir / f"{base_name}-emb-query.npy"
+    gallery_patch_path = emb_dir / f"{base_name}-patch-emb-gallery.npy"
+    query_patch_path = emb_dir / f"{base_name}-patch-emb-query.npy"
 
     np.save(gallery_path, gallery_embeddings.detach().cpu().numpy())
     np.save(query_path, query_embeddings.detach().cpu().numpy())
+
+    if gallery_patches is not None:
+        np.save(gallery_patch_path, gallery_patches.detach().cpu().numpy())
+        print(f"Saved gallery patches:    {gallery_patch_path}")
+    if query_patches is not None:
+        np.save(query_patch_path, query_patches.detach().cpu().numpy())
+        print(f"Saved query patches:      {query_patch_path}")
 
     print(f"Saved gallery embeddings: {gallery_path}")
     print(f"Saved query embeddings:   {query_path}")
