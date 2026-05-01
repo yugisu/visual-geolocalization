@@ -17,15 +17,20 @@ def flat_earth_dist_m(lat1: float, lon1: float, lats: np.ndarray, lons: np.ndarr
 def build_ground_truth(
     uav_coords: np.ndarray,
     chunk_bboxes: list[tuple[float, float, float, float]],
+    dist_threshold: float | None = None,
 ) -> list[list[int]]:
     """For each UAV query, return indices of satellite chunks whose bbox contains the GPS point.
 
+    If dist_threshold is provided, chunks within this distance (in metres) from the UAV point
+    to the chunk centre are considered positive. Otherwise, falls back to bounding box containment.
+
     Multiple overlapping chunks are sorted by distance from the UAV point to the chunk centre.
-    Falls back to the single nearest chunk when the GPS point falls outside all bboxes.
+    Falls back to the single nearest chunk when the GPS point falls outside all bboxes or threshold.
 
     Args:
         uav_coords:   (N, 2) float array of (lat, lon) per UAV image.
         chunk_bboxes: List of (lat_min, lon_min, lat_max, lon_max) per gallery chunk.
+        dist_threshold: Optional distance in metres to define positive chunks.
 
     Returns:
         List of length N; each entry is a sorted list of matching chunk indices.
@@ -38,14 +43,23 @@ def build_ground_truth(
 
     ground_truth = []
     for lat, lon in uav_coords:
-        mask = (lat_mins <= lat) & (lat <= lat_maxs) & (lon_mins <= lon) & (lon <= lon_maxs)
-        indices = np.where(mask)[0]
-        if len(indices) == 0:
+        if dist_threshold is not None:
             dists = flat_earth_dist_m(lat, lon, center_lats, center_lons)
-            indices = np.array([np.argmin(dists)])
+            mask = dists <= dist_threshold
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                indices = np.array([np.argmin(dists)])
+            else:
+                indices = indices[np.argsort(dists[indices])]
         else:
-            dists = flat_earth_dist_m(lat, lon, center_lats[indices], center_lons[indices])
-            indices = indices[np.argsort(dists)]
+            mask = (lat_mins <= lat) & (lat <= lat_maxs) & (lon_mins <= lon) & (lon <= lon_maxs)
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                dists = flat_earth_dist_m(lat, lon, center_lats, center_lons)
+                indices = np.array([np.argmin(dists)])
+            else:
+                dists = flat_earth_dist_m(lat, lon, center_lats[indices], center_lons[indices])
+                indices = indices[np.argsort(dists)]
         ground_truth.append(indices.tolist())
     return ground_truth
 
@@ -77,9 +91,10 @@ def calculate_metrics(
     preds: np.ndarray,
     uav_coords: np.ndarray,
     chunk_bboxes: list[tuple[float, float, float, float]],
+    dist_threshold: float | None = None,
 ) -> dict[str, float]:
-    """Compute Recall@1/5/10 (bbox-based) and Dis@1/5/10 (min distance among top-k)."""
-    ground_truth = build_ground_truth(uav_coords, chunk_bboxes)
+    """Compute Recall@1/5/10 and Dis@1/5/10 (min distance among top-k)."""
+    ground_truth = build_ground_truth(uav_coords, chunk_bboxes, dist_threshold=dist_threshold)
     return {
         "Recall@1": recall_at_k(preds, ground_truth, k=1),
         "Recall@5": recall_at_k(preds, ground_truth, k=5),
