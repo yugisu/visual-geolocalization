@@ -2,9 +2,10 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "marimo",
-#     "altair>=5.0.0",
+#     "altair==6.1.0",
 #     "matplotlib==3.10.9",
-#     "scikit-learn>=1.5.0",
+#     "scikit-learn==1.7.2",
+#     "umap-learn==0.5.12",
 #     "pyarrow>=16.0.0",
 #     "python-dotenv==1.2.2",
 #     "numpy==2.2.6",
@@ -17,7 +18,7 @@
 
 import marimo
 
-__generated_with = "0.23.3"
+__generated_with = "0.23.4"
 app = marimo.App(width="medium")
 
 
@@ -34,6 +35,7 @@ def _():
     import pandas as pd
     from dotenv import load_dotenv
     from sklearn.manifold import TSNE
+    import umap
 
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
@@ -46,7 +48,6 @@ def _():
     visloc_root = data_root / "visloc"
     return (
         SatChunkDataset,
-        TSNE,
         UAVDataset,
         alt,
         build_ground_truth,
@@ -55,6 +56,7 @@ def _():
         pd,
         plt,
         project_root,
+        umap,
         visloc_root,
     )
 
@@ -62,20 +64,43 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     flight_id_ui = mo.ui.dropdown(
-        options=["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"],
+        options=["03"],
         value="03",
         label="Flight ID",
     )
-    chunk_pixels_ui = mo.ui.number(start=128, stop=1024, step=32, value=512, label="Chunk pixels")
-    chunk_stride_ui = mo.ui.number(start=16, stop=512, step=16, value=128, label="Chunk stride")
-    map_scale_ui = mo.ui.number(start=0.05, stop=0.5, step=0.025, value=0.25, label="Map scale")
+    chunk_pixels_ui = mo.ui.number(
+        start=128,
+        stop=1024,
+        step=32,
+        value=512,
+        label="Chunk pixels",
+        disabled=True,
+    )
+    chunk_stride_ui = mo.ui.number(
+        start=16,
+        stop=512,
+        step=16,
+        value=128,
+        label="Chunk stride",
+        disabled=True,
+    )
+    map_scale_ui = mo.ui.number(
+        start=0.05,
+        stop=0.5,
+        step=0.025,
+        value=0.25,
+        label="Map scale",
+        disabled=True,
+    )
     retrieval_k_ui = mo.ui.slider(start=1, stop=50, step=1, value=10, label="Top-k retrieval for query context")
     max_images_ui = mo.ui.slider(start=1, stop=20, step=1, value=16, label="Max selected previews")
 
-    mo.vstack([
-        mo.hstack([flight_id_ui, map_scale_ui]),
-        mo.hstack([chunk_pixels_ui, chunk_stride_ui, retrieval_k_ui, max_images_ui]),
-    ])
+    mo.vstack(
+        [
+            mo.hstack([flight_id_ui, map_scale_ui]),
+            mo.hstack([chunk_pixels_ui, chunk_stride_ui, retrieval_k_ui, max_images_ui]),
+        ]
+    )
     return (
         chunk_pixels_ui,
         chunk_stride_ui,
@@ -106,7 +131,7 @@ def _(mo, project_root):
 
     emb_names_ui = mo.ui.dropdown(
         options=emb_names,
-        value=None,
+        value="ft-dinov3-vitb-ssl4eo_ch-visloc",
         label="Embeddings name",
     )
 
@@ -123,9 +148,7 @@ def _(emb_dir, emb_names_ui, mo, np):
     paths_ok = gallery_emb_path.exists() and query_emb_path.exists()
     mo.stop(
         not paths_ok,
-        mo.md(
-            f"Embedding files not found: {gallery_emb_path}, {query_emb_path}."
-        ),
+        mo.md(f"Embedding files not found: {gallery_emb_path}, {query_emb_path}."),
     )
 
 
@@ -171,7 +194,6 @@ def _(gallery_dataset, gallery_embeddings, mo, query_embeddings, uav_dataset):
 
 @app.cell(hide_code=True)
 def _(
-    TSNE,
     build_ground_truth,
     gallery_dataset,
     gallery_embeddings,
@@ -179,6 +201,7 @@ def _(
     pd,
     query_embeddings,
     uav_dataset,
+    umap,
 ):
     n_gallery = min(gallery_embeddings.shape[0], len(gallery_dataset))
     n_query = min(query_embeddings.shape[0], len(uav_dataset))
@@ -189,15 +212,14 @@ def _(
 
     n_total = all_embs.shape[0]
     if n_total < 4:
-        raise ValueError("Need at least 4 embeddings total to run t-SNE.")
+        raise ValueError("Need at least 4 embeddings total to run UMAP.")
 
-    perplexity = min(30, max(5, (n_total - 1) // 3))
-    coords = TSNE(
-        n_components=2,
+    n_neighbors = min(30, max(2, n_total - 1))
+    coords = umap.UMAP(
+        metric="cosine",
+        n_neighbors=100,
+        min_dist=0.1,
         random_state=42,
-        perplexity=perplexity,
-        learning_rate="auto",
-        init="pca",
     ).fit_transform(all_embs)
 
     uav_coords = uav_dataset.records[["lat", "lon"]].to_numpy(dtype=float)[:n_query]
@@ -236,8 +258,8 @@ def _(alt):
             alt.Chart(df)
             .mark_point(filled=True, size=60, opacity=0.75)
             .encode(
-                x=alt.X("x:Q", title="t-SNE Dimension 1"),
-                y=alt.Y("y:Q", title="t-SNE Dimension 2"),
+                x=alt.X("x:Q", title="UMAP Dimension 1"),
+                y=alt.Y("y:Q", title="UMAP Dimension 2"),
                 color=alt.Color("display_color:N", scale=None, legend=None),
                 shape=alt.Shape(
                     "split:N",
@@ -251,7 +273,7 @@ def _(alt):
                     alt.Tooltip("query_top1_correct:N", title="Top-1 in GT"),
                 ],
             )
-            .properties(width=900, height=400, title="Interactive t-SNE Embeddings (Query: green=top-1 hit, red=miss)")
+            .properties(width=900, height=400, title="Interactive UMAP Embeddings (Query: green=top-1 hit, red=miss)")
         )
 
     return (embedding_scatter,)
@@ -283,11 +305,7 @@ def _(
     incorrect = None
     retrieval_k = int(retrieval_k_ui.value)
 
-    selected_df = (
-        pd.DataFrame(embedding_chart.value)
-        if len(embedding_chart.value)
-        else pd.DataFrame(embedding_chart.value)
-    )
+    selected_df = pd.DataFrame(embedding_chart.value) if len(embedding_chart.value) else pd.DataFrame(embedding_chart.value)
 
     if not selected_df.empty:
         query_rows = selected_df[selected_df["split"] == "query"]
@@ -492,24 +510,11 @@ def _(
 
         guessed_correctly = pred_chunk_idx in gt_set
 
-        highlighted_df.loc[
-            gt | c_mask | ic_mask | q_mask,
-            "opacity"
-        ] = 0.7
-        highlighted_df.loc[
-            gt | c_mask | ic_mask | q_mask,
-            "stroke_width"
-        ] = 1.5
+        highlighted_df.loc[gt | c_mask | ic_mask | q_mask, "opacity"] = 0.7
+        highlighted_df.loc[gt | c_mask | ic_mask | q_mask, "stroke_width"] = 1.5
 
-        highlighted_df.loc[
-            c_mask | ic_mask,
-            "fill_color"
-        ] = "#4ECDC488"
-        highlighted_df.loc[
-            q_mask,
-            "fill_color"
-        ] = "#FF6B6B"
-
+        highlighted_df.loc[c_mask | ic_mask, "fill_color"] = "#4ECDC488"
+        highlighted_df.loc[q_mask, "fill_color"] = "#FF6B6B"
 
         highlighted_df.loc[
             gt,
@@ -523,7 +528,7 @@ def _(
             gt,
             "stroke_color",
         ] = "#FFFFFF88"
-    
+
         highlighted_df.loc[
             c_mask,
             "stroke_color",
@@ -536,7 +541,7 @@ def _(
             c_mask & highlighted_df["dataset_index"] == pred_chunk_idx,
             "fill_color",
         ] = "#E63946"
-    
+
         highlighted_df.loc[
             ic_mask,
             "stroke_color",
@@ -549,7 +554,7 @@ def _(
             ic_mask & highlighted_df["dataset_index"] == pred_chunk_idx,
             "fill_color",
         ] = "#E63946"
-    
+
         highlighted_df.loc[
             q_mask,
             "stroke_color",
@@ -570,13 +575,14 @@ def _(
             "point_size",
         ] = 300
 
+
     def context_scatter(df):
         return (
             alt.Chart(df)
             .mark_point(filled=True)
             .encode(
-                x=alt.X("x:Q", title="t-SNE Dimension 1"),
-                y=alt.Y("y:Q", title="t-SNE Dimension 2"),
+                x=alt.X("x:Q", title="UMAP Dimension 1"),
+                y=alt.Y("y:Q", title="UMAP Dimension 2"),
                 color=alt.Color("fill_color:N", scale=None, legend=None),
                 stroke=alt.Color("stroke_color:N", scale=None, legend=None),
                 strokeWidth=alt.StrokeWidth("stroke_width:Q", legend=None),
@@ -586,18 +592,16 @@ def _(
                     legend=alt.Legend(title="Embedding set"),
                 ),
                 size=alt.Size("point_size:Q", legend=None),
-                opacity=alt.Opacity(
-                    "opacity:Q",
-                    legend=None
-                ),
+                opacity=alt.Opacity("opacity:Q", legend=None),
                 tooltip=[
                     alt.Tooltip("split:N", title="Set"),
                     alt.Tooltip("dataset_index:Q", title="Dataset index"),
                     alt.Tooltip("embedding_index:Q", title="Embedding index"),
                 ],
             )
-            .properties(width=900, height=460, title="Interactive t-SNE with GT/Correct/Incorrect Highlights")
+            .properties(width=900, height=460, title="Interactive UMAP with GT/Correct/Incorrect Highlights")
         )
+
 
     context_chart = mo.ui.altair_chart(context_scatter(highlighted_df))
     mo.md(
