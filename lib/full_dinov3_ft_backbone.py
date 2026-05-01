@@ -20,6 +20,7 @@ Usage:
     sims = model.retrieve(query_imgs, gallery_imgs, tta=True, patch_rerank=True)
     ranked = np.argsort(-sims, axis=1)               # [N_q, N_g] ranked indices
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -29,7 +30,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 DINO_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-DEFAULT_CHECKPOINT = "checkpoints/dinov3-st2-ssl4eos12-best-r@1=0.86-448c62e.ckpt"
+DEFAULT_CHECKPOINT = "dinov3-ssl4eos12-visloc-smoothap-r@1=0.85-1c95460.ckpt"
 
 
 class DINOv3Retriever(nn.Module):
@@ -185,8 +186,8 @@ class DINOv3Retriever(nn.Module):
         sims = sims.copy()
         for i in range(len(sims)):
             top_k = np.argsort(-sims[i])[:K]
-            uav_p = q_patches[i]                            # [P, D]
-            sat_k = g_patches[top_k]                        # [K, P, D]
+            uav_p = q_patches[i]  # [P, D]
+            sat_k = g_patches[top_k]  # [K, P, D]
             sim_mat = uav_p.unsqueeze(0) @ sat_k.transpose(-1, -2)  # [K, P, P]
             patch_sims = sim_mat.max(dim=2).values.mean(dim=1).cpu().numpy()  # [K]
             sims[i, top_k] = alpha * sims[i, top_k] + (1 - alpha) * patch_sims

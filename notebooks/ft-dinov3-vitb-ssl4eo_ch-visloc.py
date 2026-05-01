@@ -16,7 +16,7 @@
 
 import marimo
 
-__generated_with = "0.23.3"
+__generated_with = "0.23.4"
 app = marimo.App(width="medium")
 
 
@@ -45,15 +45,20 @@ def _():
     from lib.full_dinov3_ft_backbone import DINOv3Retriever, DINO_MODEL, DEFAULT_CHECKPOINT
 
     load_dotenv(project_root / ".env")
+
     data_root = Path(os.environ["DATA_ROOT"])
     visloc_root = data_root / "visloc"
+    assert visloc_root.exists(), visloc_root
+
+    ckpt_root = Path(os.environ["CHECKPOINTS_ROOT"])
+    ckpt_path = ckpt_root / DEFAULT_CHECKPOINT
+    assert ckpt_path.exists(), ckpt_path
 
     warnings.filterwarnings("ignore", message=".*invalid escape sequence.*")
 
     NUM_WORKERS = 8
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return (
-        DEFAULT_CHECKPOINT,
         DEVICE,
         DINO_MODEL,
         DINOv3Retriever,
@@ -63,6 +68,7 @@ def _():
         SatChunkDataset,
         UAVDataset,
         calculate_metrics,
+        ckpt_path,
         np,
         pd,
         project_root,
@@ -75,11 +81,11 @@ def _():
 
 
 @app.cell
-def _(DEFAULT_CHECKPOINT, DEVICE, DINO_MODEL, DINOv3Retriever):
+def _(DEVICE, DINO_MODEL, DINOv3Retriever, ckpt_path):
     from transformers import AutoImageProcessor
 
     processor = AutoImageProcessor.from_pretrained(DINO_MODEL)
-    model = DINOv3Retriever(ckpt_path=DEFAULT_CHECKPOINT, model_name=DINO_MODEL)
+    model = DINOv3Retriever(ckpt_path=ckpt_path, model_name=DINO_MODEL)
 
     model = model.to(DEVICE).eval()
 
