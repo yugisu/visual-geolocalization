@@ -389,12 +389,47 @@ def _(
     _fig, _ax = plt.subplots(figsize=(12, 8))
     _ax.imshow(_sat_img)
 
+    chunk_origins = np.array([(x, y) for x, y, _, _ in gallery_dataset._chunks], dtype=int)
+    if len(chunk_origins) > 0:
+        x_edges = np.unique(np.concatenate([chunk_origins[:, 0], chunk_origins[:, 0] + chunk_pixels_ui.value]))
+        y_edges = np.unique(np.concatenate([chunk_origins[:, 1], chunk_origins[:, 1] + chunk_pixels_ui.value]))
+        first_chunk_rect = (int(chunk_origins[0, 0]), int(chunk_origins[0, 1]), int(chunk_pixels_ui.value), int(chunk_pixels_ui.value))
+    else:
+        x_edges = np.array([], dtype=int)
+        y_edges = np.array([], dtype=int)
+        first_chunk_rect = None
+
+    if len(x_edges) > 0 and len(y_edges) > 0:
+        _ax.vlines(
+            x_edges,
+            ymin=int(y_edges.min()),
+            ymax=int(y_edges.max()),
+            colors="#ffffff",
+            linewidth=0.25,
+            alpha=0.4,
+            zorder=2,
+        )
+        _ax.hlines(
+            y_edges,
+            xmin=int(x_edges.min()),
+            xmax=int(x_edges.max()),
+            colors="#ffffff",
+            linewidth=0.25,
+            alpha=0.4,
+            zorder=2,
+        )
+
     _has_selection = focus_query_idx is not None and 0 <= int(focus_query_idx) < _n_query
-    _bg_line_alpha = 0.1 if _has_selection else 0.9
-    _bg_point_alpha = 0.1 if _has_selection else 0.55
-    _pred_line_alpha = 0.1 if _has_selection else 0.55
-    _pred_point_alpha = 0.1 if _has_selection else 0.85
-    _endpoint_alpha = 0.1 if _has_selection else 1.0
+    # _bg_line_alpha = 0.1 if _has_selection else 0.9
+    # _bg_point_alpha = 0.1 if _has_selection else 0.55
+    # _pred_line_alpha = 0.1 if _has_selection else 0.55
+    # _pred_point_alpha = 0.1 if _has_selection else 0.85
+    # _endpoint_alpha = 0.1 if _has_selection else 1.0
+    _bg_line_alpha = 0.0 if _has_selection else 0.9
+    _bg_point_alpha = 0.0 if _has_selection else 0.55
+    _pred_line_alpha = 0.0 if _has_selection else 0.55
+    _pred_point_alpha = 0.0 if _has_selection else 0.85
+    _endpoint_alpha = 0.0 if _has_selection else 1.0
 
     _ax.plot(_gt_x, _gt_y, color="#2ECC71", linewidth=2.0, alpha=_bg_line_alpha, label="Ground truth flight")
     _ax.scatter(_gt_x, _gt_y, color="#2ECC71", s=7, alpha=_bg_point_alpha, zorder=3)
@@ -464,6 +499,8 @@ def _(
     _ax.legend(loc="upper right", framealpha=0.9)
     _ax.axis("off")
     _fig.tight_layout(pad=0)
+
+    _fig.savefig("fig.png", dpi=250)
 
     #    **Full-flight overlay: predicted vs ground truth**
 
