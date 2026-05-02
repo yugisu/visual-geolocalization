@@ -119,7 +119,7 @@ def _(
     drone_df = uav_ds.records
     xs = ((drone_df["lon"] - lon_min) / (lon_max - lon_min) * w).to_numpy(dtype=float)
     ys = ((lat_max - drone_df["lat"]) / (lat_max - lat_min) * h).to_numpy(dtype=float)
-    
+
     uav_coords = drone_df[["lat", "lon"]].to_numpy(dtype=float)
     chunk_bboxes = sat_ds.chunk_bboxes
     return chunk_bboxes, chunk_origins, chunk_pixels, first_chunk_rect, sat_img, uav_coords, x_edges, xs, y_edges, ys
@@ -129,7 +129,7 @@ def _(
 def _(project_root, np):
     emb_dir = project_root / "embeddings"
     emb_name = "ft-dinov3-vitb-ssl4eo_ch-visloc-tta"
-    
+
     gallery_emb_path = emb_dir / f"{emb_name}-emb-gallery.npy"
     query_emb_path = emb_dir / f"{emb_name}-emb-query.npy"
     gallery_patch_path = emb_dir / f"{emb_name}-patch-emb-gallery.npy"
@@ -137,15 +137,15 @@ def _(project_root, np):
 
     gallery_embeddings = np.load(gallery_emb_path)
     query_embeddings = np.load(query_emb_path)
-    gallery_patch_embeddings = np.load(gallery_patch_path, mmap_mode='r')
-    query_patch_embeddings = np.load(query_patch_path, mmap_mode='r')
+    gallery_patch_embeddings = np.load(gallery_patch_path, mmap_mode="r")
+    query_patch_embeddings = np.load(query_patch_path, mmap_mode="r")
     return gallery_embeddings, gallery_patch_embeddings, query_embeddings, query_patch_embeddings
 
 
 @app.cell(hide_code=True)
 def _(gallery_embeddings, gallery_patch_embeddings, np, query_embeddings, query_patch_embeddings):
     import torch
-    
+
     def chamfer_rerank(sims, q_patches, g_patches, K, alpha, batch_size=32, device=None):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -160,7 +160,7 @@ def _(gallery_embeddings, gallery_patch_embeddings, np, query_embeddings, query_
         for i in range(0, N_q, batch_size):
             end = min(i + batch_size, N_q)
             q_p = q_patches[i:end].to(device).unsqueeze(1)  # [B, 1, P, D]
-            g_p_chunk = g_patches[top_k_tensor[i:end]].to(device) # [B, K, P, D]
+            g_p_chunk = g_patches[top_k_tensor[i:end]].to(device)  # [B, K, P, D]
 
             sim_mat = q_p @ g_p_chunk.transpose(-1, -2)  # [B, K, P_q, P_g]
             patch_sims = sim_mat.max(dim=-1).values.mean(dim=-1)  # [B, K]
@@ -182,18 +182,12 @@ def _(gallery_embeddings, gallery_patch_embeddings, np, query_embeddings, query_
     q_patches_tensor = torch.from_numpy(query_patch_embeddings).float()
     g_patches_tensor = torch.from_numpy(gallery_patch_embeddings).float()
 
-    reranked_topk_preds = chamfer_rerank(
-        sims,
-        q_patches_tensor,
-        g_patches_tensor,
-        K=50,
-        alpha=0.5
-    )
+    reranked_topk_preds = chamfer_rerank(sims, q_patches_tensor, g_patches_tensor, K=50, alpha=0.5)
 
     preds_reranked = preds.copy()
     preds_reranked[:, :50] = reranked_topk_preds
     top1_preds = preds_reranked[:, 0]
-    
+
     return chamfer_rerank, preds, preds_reranked, top1_preds
 
 
@@ -227,27 +221,27 @@ def _(
     n_query = min(len(xs), len(top1_preds))
     n_gallery = len(chunk_bboxes)
     ground_truth = build_ground_truth(uav_coords[:n_query], chunk_bboxes)
-    
+
     pred_xs_corr, pred_ys_corr = [], []
     pred_xs_inc, pred_ys_inc = [], []
-    
+
     for i in range(n_query):
         pred_idx = top1_preds[i]
         is_correct = pred_idx in ground_truth[i]
         color = "#22cc22" if is_correct else "#ee4444"
-        
+
         if pred_idx < len(chunk_origins):
             px_x, px_y = chunk_origins[pred_idx]
             pred_x = px_x + chunk_pixels / 2
             pred_y = px_y + chunk_pixels / 2
-            
+
             if is_correct:
                 pred_xs_corr.append(pred_x)
                 pred_ys_corr.append(pred_y)
             else:
                 pred_xs_inc.append(pred_x)
                 pred_ys_inc.append(pred_y)
-            
+
             ax.plot([xs[i], pred_x], [ys[i], pred_y], color=color, linewidth=0.5, alpha=0.6, zorder=3)
         else:
             if is_correct:
@@ -266,7 +260,7 @@ def _(
     ax.axis("off")
     fig.tight_layout(pad=0)
 
-    out_path = project_root / "out" / "fig-visloc-val-flight-best-recreation.png"
+    out_path = project_root / "out" / "fig-visloc-val-recreation.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"Saved: {out_path}")
