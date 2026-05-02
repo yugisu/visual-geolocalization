@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "marimo",
+#     "jedi<0.20.0",
 #     "numpy==2.2.6",
 #     "pandas==2.3.3",
 #     "python-dotenv==1.2.2",

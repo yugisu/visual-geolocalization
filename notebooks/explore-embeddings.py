@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "marimo",
+#     "jedi<0.20.0",
 #     "altair==6.1.0",
 #     "matplotlib==3.10.9",
 #     "scikit-learn==1.7.2",

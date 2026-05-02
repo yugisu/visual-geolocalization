@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "marimo",
+#     "jedi<0.20.0",
 #     "python-dotenv==1.2.2",
 #     "torch>=2.2.0",
 #     "torchvision",
