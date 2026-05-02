@@ -143,7 +143,7 @@ def _(
             ymax=int(y_edges.max()),
             colors="#ffffff",
             linewidth=0.25,
-            alpha=0.6,
+            alpha=0.4,
             zorder=2,
         )
         ax.hlines(
@@ -152,7 +152,7 @@ def _(
             xmax=int(x_edges.max()),
             colors="#ffffff",
             linewidth=0.25,
-            alpha=0.6,
+            alpha=0.4,
             zorder=2,
         )
 
@@ -170,11 +170,12 @@ def _(
             )
         )
 
-    ax.plot(xs, ys, color="#22cc22", linewidth=1.5, alpha=0.85)
-    ax.scatter(xs, ys, color="#22cc22", s=8, zorder=4, alpha=0.9)
+    ax.plot(xs, ys, color="#ffdd00", linewidth=1, alpha=0.85, label="Flight trajectory")
+    ax.scatter(xs, ys, color="#ffdd00", s=8, zorder=4, alpha=0.9)
     ax.plot(xs[0], ys[0], "o", color="#ee4444", markersize=8, label="Start", zorder=5)
     ax.plot(xs[-1], ys[-1], "o", color="#4444ee", markersize=8, label="End", zorder=5)
     ax.axis("off")
+    ax.legend(loc="upper right")
     fig.tight_layout(pad=0)
 
     if mo.app_meta().mode == "script":

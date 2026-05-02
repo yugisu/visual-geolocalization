@@ -1,0 +1,279 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "marimo",
+#     "jedi<0.20.0",
+#     "python-dotenv==1.2.2",
+#     "numpy==2.2.6",
+#     "matplotlib==3.10.9",
+#     "pandas==2.3.3",
+#     "rasterio==1.4.4",
+#     "torch",
+#     "torchvision",
+# ]
+# ///
+
+import marimo
+
+__generated_with = "0.23.3"
+app = marimo.App(width="medium")
+
+
+@app.cell(hide_code=True)
+def _():
+    import sys
+    import os
+    from pathlib import Path
+
+    import marimo as mo
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from dotenv import load_dotenv
+
+    project_root = Path(__file__).parent.parent
+    sys.path.insert(0, str(project_root))
+
+    from lib.visloc import UAVDataset, SatChunkDataset
+    from lib.evaluation import build_ground_truth
+
+    load_dotenv(project_root / ".env")
+    data_root = Path(os.environ["DATA_ROOT"])
+    return (
+        Rectangle,
+        SatChunkDataset,
+        UAVDataset,
+        build_ground_truth,
+        data_root,
+        mo,
+        np,
+        plt,
+        project_root,
+    )
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    VALIDATION_FLIGHT = "03"
+
+    flight_dropdown = mo.ui.dropdown(
+        options=["01", "02", "03", "04", "05", "06", "08", "09", "10", "11"],
+        value=VALIDATION_FLIGHT,
+        label="Flight ID",
+    )
+    map_scale_slider = mo.ui.number(start=0.05, stop=0.5, step=0.05, value=0.25, label="Map scale")
+    chunk_pixels_slider = mo.ui.number(start=128, stop=1024, step=32, value=512, label="Chunk size (px)")
+    chunk_stride_slider = mo.ui.number(start=16, stop=512, step=16, value=128, label="Chunk stride (px)")
+
+    mo.vstack([
+        mo.hstack([flight_dropdown, map_scale_slider]),
+        mo.hstack([chunk_pixels_slider, chunk_stride_slider]),
+    ])
+    return (
+        chunk_pixels_slider,
+        chunk_stride_slider,
+        flight_dropdown,
+        map_scale_slider,
+    )
+
+
+@app.cell(hide_code=True)
+def _(
+    SatChunkDataset,
+    UAVDataset,
+    chunk_pixels_slider,
+    chunk_stride_slider,
+    data_root,
+    flight_dropdown,
+    map_scale_slider,
+    np,
+):
+    flight_id = flight_dropdown.value
+    visloc_root = data_root / "visloc"
+    chunk_pixels = chunk_pixels_slider.value
+    chunk_stride = chunk_stride_slider.value
+
+    uav_ds = UAVDataset(visloc_root, flight_id)
+    sat_ds = SatChunkDataset(
+        visloc_root,
+        flight_id,
+        chunk_pixels=chunk_pixels,
+        stride_pixels=chunk_stride,
+        scale_factor=map_scale_slider.value,
+    )
+
+    sat_img = sat_ds._img
+    h, w = sat_img.shape[:2]
+    lat_min, lon_min, lat_max, lon_max = sat_ds._bounds
+
+    chunk_origins = np.array([(x, y) for x, y, _, _ in sat_ds._chunks], dtype=int)
+    if len(chunk_origins) > 0:
+        x_edges = np.unique(np.concatenate([chunk_origins[:, 0], chunk_origins[:, 0] + chunk_pixels]))
+        y_edges = np.unique(np.concatenate([chunk_origins[:, 1], chunk_origins[:, 1] + chunk_pixels]))
+        first_chunk_rect = (int(chunk_origins[0, 0]), int(chunk_origins[0, 1]), int(chunk_pixels), int(chunk_pixels))
+    else:
+        x_edges = np.array([], dtype=int)
+        y_edges = np.array([], dtype=int)
+        first_chunk_rect = None
+
+    drone_df = uav_ds.records
+    xs = ((drone_df["lon"] - lon_min) / (lon_max - lon_min) * w).to_numpy(dtype=float)
+    ys = ((lat_max - drone_df["lat"]) / (lat_max - lat_min) * h).to_numpy(dtype=float)
+    
+    uav_coords = drone_df[["lat", "lon"]].to_numpy(dtype=float)
+    chunk_bboxes = sat_ds.chunk_bboxes
+    return chunk_bboxes, chunk_origins, chunk_pixels, first_chunk_rect, sat_img, uav_coords, x_edges, xs, y_edges, ys
+
+
+@app.cell(hide_code=True)
+def _(project_root, np):
+    emb_dir = project_root / "embeddings"
+    emb_name = "ft-dinov3-vitb-ssl4eo_ch-visloc-tta"
+    
+    gallery_emb_path = emb_dir / f"{emb_name}-emb-gallery.npy"
+    query_emb_path = emb_dir / f"{emb_name}-emb-query.npy"
+    gallery_patch_path = emb_dir / f"{emb_name}-patch-emb-gallery.npy"
+    query_patch_path = emb_dir / f"{emb_name}-patch-emb-query.npy"
+
+    gallery_embeddings = np.load(gallery_emb_path)
+    query_embeddings = np.load(query_emb_path)
+    gallery_patch_embeddings = np.load(gallery_patch_path, mmap_mode='r')
+    query_patch_embeddings = np.load(query_patch_path, mmap_mode='r')
+    return gallery_embeddings, gallery_patch_embeddings, query_embeddings, query_patch_embeddings
+
+
+@app.cell(hide_code=True)
+def _(gallery_embeddings, gallery_patch_embeddings, np, query_embeddings, query_patch_embeddings):
+    import torch
+    
+    def chamfer_rerank(sims, q_patches, g_patches, K, alpha, batch_size=32, device=None):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+
+        N_q = len(sims)
+        preds = np.argsort(-sims, axis=1)[:, :K]
+        new_preds = np.zeros_like(preds)
+        top_k_tensor = torch.from_numpy(preds)
+
+        for i in range(0, N_q, batch_size):
+            end = min(i + batch_size, N_q)
+            q_p = q_patches[i:end].to(device).unsqueeze(1)  # [B, 1, P, D]
+            g_p_chunk = g_patches[top_k_tensor[i:end]].to(device) # [B, K, P, D]
+
+            sim_mat = q_p @ g_p_chunk.transpose(-1, -2)  # [B, K, P_q, P_g]
+            patch_sims = sim_mat.max(dim=-1).values.mean(dim=-1)  # [B, K]
+
+            idx_b = np.arange(i, end)[:, None]
+            k_idx_b = preds[i:end]
+            global_sims = sims[idx_b, k_idx_b]
+
+            blended_sims = alpha * global_sims + (1 - alpha) * patch_sims.cpu().numpy()
+
+            sort_idx = np.argsort(-blended_sims, axis=1)  # [B, K]
+            new_preds[i:end] = np.take_along_axis(preds[i:end], sort_idx, axis=1)
+
+        return new_preds
+
+    sims = query_embeddings @ gallery_embeddings.T
+    preds = np.argsort(-sims, axis=1)
+
+    q_patches_tensor = torch.from_numpy(query_patch_embeddings).float()
+    g_patches_tensor = torch.from_numpy(gallery_patch_embeddings).float()
+
+    reranked_topk_preds = chamfer_rerank(
+        sims,
+        q_patches_tensor,
+        g_patches_tensor,
+        K=50,
+        alpha=0.5
+    )
+
+    preds_reranked = preds.copy()
+    preds_reranked[:, :50] = reranked_topk_preds
+    top1_preds = preds_reranked[:, 0]
+    
+    return chamfer_rerank, preds, preds_reranked, top1_preds
+
+
+@app.cell(hide_code=True)
+def _(
+    Rectangle,
+    build_ground_truth,
+    chunk_bboxes,
+    chunk_origins,
+    chunk_pixels,
+    first_chunk_rect,
+    mo,
+    plt,
+    project_root,
+    sat_img,
+    top1_preds,
+    uav_coords,
+    x_edges,
+    xs,
+    y_edges,
+    ys,
+):
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    ax.imshow(sat_img)
+
+    # Draw Ground truth
+    ax.scatter(xs, ys, color="#ffdd00", s=8, zorder=4, alpha=0.5, label="Ground truth")
+
+    # Draw Predictions
+    n_query = min(len(xs), len(top1_preds))
+    n_gallery = len(chunk_bboxes)
+    ground_truth = build_ground_truth(uav_coords[:n_query], chunk_bboxes)
+    
+    pred_xs_corr, pred_ys_corr = [], []
+    pred_xs_inc, pred_ys_inc = [], []
+    
+    for i in range(n_query):
+        pred_idx = top1_preds[i]
+        is_correct = pred_idx in ground_truth[i]
+        color = "#22cc22" if is_correct else "#ee4444"
+        
+        if pred_idx < len(chunk_origins):
+            px_x, px_y = chunk_origins[pred_idx]
+            pred_x = px_x + chunk_pixels / 2
+            pred_y = px_y + chunk_pixels / 2
+            
+            if is_correct:
+                pred_xs_corr.append(pred_x)
+                pred_ys_corr.append(pred_y)
+            else:
+                pred_xs_inc.append(pred_x)
+                pred_ys_inc.append(pred_y)
+            
+            ax.plot([xs[i], pred_x], [ys[i], pred_y], color=color, linewidth=0.5, alpha=0.6, zorder=3)
+        else:
+            if is_correct:
+                pred_xs_corr.append(xs[i])
+                pred_ys_corr.append(ys[i])
+            else:
+                pred_xs_inc.append(xs[i])
+                pred_ys_inc.append(ys[i])
+
+    if pred_xs_corr:
+        ax.scatter(pred_xs_corr, pred_ys_corr, color="#1df533", s=10, marker="x", label="Correct Prediction", zorder=4, alpha=0.9)
+    if pred_xs_inc:
+        ax.scatter(pred_xs_inc, pred_ys_inc, color="#fa4343", s=10, marker="x", label="Incorrect Prediction", zorder=4, alpha=0.9)
+
+    ax.legend(loc="upper right")
+    ax.axis("off")
+    fig.tight_layout(pad=0)
+
+    out_path = project_root / "out" / "fig-visloc-val-flight-best-recreation.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"Saved: {out_path}")
+
+    fig
+    return (fig,)
+
+
+if __name__ == "__main__":
+    app.run()
