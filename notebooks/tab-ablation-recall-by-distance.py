@@ -110,7 +110,7 @@ def _(mo, project_root):
 
     emb_names_ui = mo.ui.dropdown(
         options=emb_names,
-        value="ft-dinov3-vitb-ssl4eo_ch-visloc" if "ft-dinov3-vitb-ssl4eo_ch-visloc" in emb_names else (emb_names[0] if emb_names else None),
+        value="ft-dinov3-vitb-ssl4eo_ch-visloc-tta" if "ft-dinov3-vitb-ssl4eo_ch-visloc-tta" in emb_names else (emb_names[0] if emb_names else None),
         label="Embeddings name",
     )
 
@@ -122,19 +122,35 @@ def _(mo, project_root):
 def _(emb_dir, emb_names_ui, mo, np):
     gallery_emb_path = emb_dir / f"{emb_names_ui.value}-emb-gallery.npy"
     query_emb_path = emb_dir / f"{emb_names_ui.value}-emb-query.npy"
+    gallery_patch_path = emb_dir / f"{emb_names_ui.value}-patch-emb-gallery.npy"
+    query_patch_path = emb_dir / f"{emb_names_ui.value}-patch-emb-query.npy"
 
-    paths_ok = gallery_emb_path.exists() and query_emb_path.exists()
+    paths_ok = (
+        gallery_emb_path.exists() and 
+        query_emb_path.exists() and 
+        gallery_patch_path.exists() and 
+        query_patch_path.exists()
+    )
     mo.stop(
         not paths_ok,
-        mo.md(f"Embedding files not found: {gallery_emb_path}, {query_emb_path}."),
+        mo.md(f"Embedding files not found: {gallery_emb_path}, {query_emb_path}, {gallery_patch_path}, {query_patch_path}."),
     )
 
     gallery_embeddings = np.load(gallery_emb_path)
     query_embeddings = np.load(query_emb_path)
+    gallery_patch_embeddings = np.load(gallery_patch_path, mmap_mode='r')
+    query_patch_embeddings = np.load(query_patch_path, mmap_mode='r')
 
     print(f"Loaded gallery embeddings: {gallery_embeddings.shape} from {gallery_emb_path}")
     print(f"Loaded query embeddings:   {query_embeddings.shape} from {query_emb_path}")
-    return gallery_embeddings, query_embeddings
+    print(f"Loaded gallery patch embeddings: {gallery_patch_embeddings.shape} from {gallery_patch_path}")
+    print(f"Loaded query patch embeddings:   {query_patch_embeddings.shape} from {query_patch_path}")
+    return (
+        gallery_embeddings,
+        gallery_patch_embeddings,
+        query_embeddings,
+        query_patch_embeddings,
+    )
 
 
 @app.cell(hide_code=True)
@@ -164,22 +180,82 @@ def _(
     calculate_metrics,
     gallery_dataset,
     gallery_embeddings,
+    gallery_patch_embeddings,
     np,
     pd,
+    project_root,
     query_embeddings,
+    query_patch_embeddings,
     uav_dataset,
 ):
+    import torch
+
+    def chamfer_rerank(
+        sims: np.ndarray,
+        q_patches: torch.Tensor,
+        g_patches: torch.Tensor,
+        K: int,
+        alpha: float,
+        batch_size: int = 32,
+        device: str | torch.device | None = None,
+    ) -> np.ndarray:
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+
+        N_q = len(sims)
+        preds = np.argsort(-sims, axis=1)[:, :K]
+        new_preds = np.zeros_like(preds)
+
+        top_k_tensor = torch.from_numpy(preds)
+
+        for i in range(0, N_q, batch_size):
+            end = min(i + batch_size, N_q)
+            q_p = q_patches[i:end].to(device).unsqueeze(1)  # [B, 1, P, D]
+            g_p_chunk = g_patches[top_k_tensor[i:end]].to(device) # [B, K, P, D]
+
+            sim_mat = q_p @ g_p_chunk.transpose(-1, -2)  # [B, K, P_q, P_g]
+            patch_sims = sim_mat.max(dim=-1).values.mean(dim=-1)  # [B, K]
+
+            idx_b = np.arange(i, end)[:, None]
+            k_idx_b = preds[i:end]
+            global_sims = sims[idx_b, k_idx_b]
+
+            blended_sims = alpha * global_sims + (1 - alpha) * patch_sims.cpu().numpy()
+
+            sort_idx = np.argsort(-blended_sims, axis=1)  # [B, K]
+            new_preds[i:end] = np.take_along_axis(preds[i:end], sort_idx, axis=1)
+
+        return new_preds
+
     n_gallery = min(gallery_embeddings.shape[0], len(gallery_dataset))
     n_query = min(query_embeddings.shape[0], len(uav_dataset))
 
     gallery_trim = gallery_embeddings[:n_gallery]
     query_trim = query_embeddings[:n_query]
+    gallery_patch_trim = gallery_patch_embeddings[:n_gallery]
+    query_patch_trim = query_patch_embeddings[:n_query]
 
     # Compute similarity and predictions
     # query_trim: (n_query, embed_dim)
     # gallery_trim: (n_gallery, embed_dim)
     sims = query_trim @ gallery_trim.T  # shape: (n_query, n_gallery)
     preds = np.argsort(-sims, axis=1)
+
+    q_patches_tensor = torch.from_numpy(query_patch_trim).float()
+    g_patches_tensor = torch.from_numpy(gallery_patch_trim).float()
+
+    reranked_topk_preds = chamfer_rerank(
+        sims,
+        q_patches_tensor,
+        g_patches_tensor,
+        K=50,
+        alpha=0.5
+    )
+
+    preds_reranked = preds.copy()
+    preds_reranked[:, :50] = reranked_topk_preds
 
     uav_coords = uav_dataset.records[["lat", "lon"]].to_numpy(dtype=float)[:n_query]
     chunk_bboxes = gallery_dataset.chunk_bboxes[:n_gallery]
@@ -188,8 +264,14 @@ def _(
 
     results = []
     for th in thresholds:
-        metrics = calculate_metrics(
+        metrics_baseline = calculate_metrics(
             preds=preds,
+            uav_coords=uav_coords,
+            chunk_bboxes=chunk_bboxes,
+            dist_threshold=th
+        )
+        metrics_reranked = calculate_metrics(
+            preds=preds_reranked,
             uav_coords=uav_coords,
             chunk_bboxes=chunk_bboxes,
             dist_threshold=th
@@ -198,13 +280,20 @@ def _(
         definition = "bbox" if th is None else f"{int(th)}m"
         results.append({
             "Positive chunk definition": definition,
-            "R@1": metrics.get("Recall@1", 0.0),
+            "Baseline R@1": metrics_baseline.get("Recall@1", 0.0),
+            "Reranked R@1": metrics_reranked.get("Recall@1", 0.0),
         })
 
     results_df = pd.DataFrame(results)
 
+    out_dir = project_root / "out"
+    out_dir.mkdir(exist_ok=True, parents=True)
+    out_csv = out_dir / "tab-ablation-recall-by-distance.csv"
+    results_df.to_csv(out_csv, index=False)
+    print(f"Saved results to {out_csv}")
+
     print(results_df)
-    return (results_df,)
+    return chamfer_rerank, results_df
 
 
 @app.cell(hide_code=True)
